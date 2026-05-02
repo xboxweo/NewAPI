@@ -4,7 +4,13 @@ set -eu
 DB_PATH="${DB_PATH:-/data/newapi/one-api.db}"
 BACKUP_NAME="${BACKUP_NAME:-one-api}"
 BACKUP_DIR="${BACKUP_DIR:-/tmp/sqlite-backup}"
+BACKUP_FILE="$BACKUP_DIR/${BACKUP_NAME}.db"
+
+RESTORE_DIR="${RESTORE_DIR:-/tmp/restic-restore}"
 RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR:-/tmp/restic-cache}"
+RESTIC_HOST="${RESTIC_HOST:-new-api}"
+
+KEEP_LAST="${KEEP_LAST:-5}"
 
 : "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required}"
 : "${RESTIC_PASSWORD:?RESTIC_PASSWORD is required}"
@@ -47,10 +53,91 @@ seconds_until_backup_time() {
     echo "$WAIT_SECONDS"
 }
 
-backup_once() {
-    TS="$(date '+%Y%m%d-%H%M%S')"
-    BACKUP_FILE="$BACKUP_DIR/${BACKUP_NAME}-${TS}.db"
+check_backup_time_format() {
+    if [ -n "${BACKUP_TIME:-}" ]; then
+        case "$BACKUP_TIME" in
+            [0-2][0-9]:[0-5][0-9]|[0-9]:[0-5][0-9])
+                ;;
+            *)
+                log "invalid BACKUP_TIME: $BACKUP_TIME, expected format: HH:MM"
+                exit 1
+                ;;
+        esac
+    fi
+}
 
+init_repo_if_needed() {
+    if [ "${RESTIC_INIT:-0}" = "1" ]; then
+        log "checking restic repository"
+
+        if ! restic --cache-dir "$RESTIC_CACHE_DIR" snapshots >/dev/null 2>&1; then
+            log "initializing restic repository"
+            restic --cache-dir "$RESTIC_CACHE_DIR" init
+        else
+            log "restic repository already initialized"
+        fi
+    fi
+}
+
+restore_latest() {
+    log "RESTORE_ON_START=1, restoring latest backup from remote repository"
+
+    rm -rf "$RESTORE_DIR"
+    mkdir -p "$RESTORE_DIR"
+
+    if ! restic --cache-dir "$RESTIC_CACHE_DIR" restore latest \
+        --target "$RESTORE_DIR" \
+        --host "$RESTIC_HOST" \
+        --tag sqlite \
+        --tag newapi \
+        --tag "$BACKUP_NAME"; then
+
+        log "no backup restored from remote repository"
+
+        if [ "${RESTORE_REQUIRED:-0}" = "1" ]; then
+            log "RESTORE_REQUIRED=1, exiting"
+            exit 1
+        fi
+
+        log "skip restore and continue"
+        return 0
+    fi
+
+    RESTORED_FILE="$RESTORE_DIR$BACKUP_FILE"
+
+    if [ ! -f "$RESTORED_FILE" ]; then
+        RESTORED_FILE="$(find "$RESTORE_DIR" -type f -name "${BACKUP_NAME}.db" | sort | tail -n 1 || true)"
+    fi
+
+    if [ -z "${RESTORED_FILE:-}" ] || [ ! -f "$RESTORED_FILE" ]; then
+        log "restored file not found"
+
+        if [ "${RESTORE_REQUIRED:-0}" = "1" ]; then
+            exit 1
+        fi
+
+        return 0
+    fi
+
+    DB_DIR="$(dirname "$DB_PATH")"
+    mkdir -p "$DB_DIR"
+
+    TMP_DB="${DB_PATH}.restore.tmp"
+
+    log "overwriting local database"
+    log "source: $RESTORED_FILE"
+    log "target: $DB_PATH"
+
+    cat "$RESTORED_FILE" > "$TMP_DB"
+    mv -f "$TMP_DB" "$DB_PATH"
+
+    rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
+
+    log "restore finished"
+}
+
+backup_once() {
+    log "starting sqlite backup"
     log "SQLite DB: $DB_PATH"
     log "Backup file: $BACKUP_FILE"
 
@@ -59,28 +146,38 @@ backup_once() {
         exit 1
     fi
 
+    mkdir -p "$BACKUP_DIR"
+
+    TMP_BACKUP_FILE="${BACKUP_FILE}.tmp"
+
+    rm -f "$TMP_BACKUP_FILE" "$BACKUP_FILE"
+
     sqlite3 "$DB_PATH" <<EOF
 .timeout 10000
-.backup '$BACKUP_FILE'
+.backup '$TMP_BACKUP_FILE'
 EOF
 
-    log "uploading to Cloudflare R2 by restic"
+    mv -f "$TMP_BACKUP_FILE" "$BACKUP_FILE"
 
-    restic backup "$BACKUP_FILE" \
-        --cache-dir "$RESTIC_CACHE_DIR" \
+    log "uploading backup to remote repository"
+
+    restic --cache-dir "$RESTIC_CACHE_DIR" backup "$BACKUP_FILE" \
+        --host "$RESTIC_HOST" \
         --tag sqlite \
         --tag newapi \
-        --tag one-api
+        --tag "$BACKUP_NAME"
 
     if [ "${RESTIC_FORGET:-1}" = "1" ]; then
-        log "applying retention policy"
+        log "applying retention policy: keep last $KEEP_LAST backups"
 
-        restic forget \
-            --cache-dir "$RESTIC_CACHE_DIR" \
-            --prune \
-            --keep-daily "${KEEP_DAILY:-7}" \
-            --keep-weekly "${KEEP_WEEKLY:-4}" \
-            --keep-monthly "${KEEP_MONTHLY:-6}"
+        restic --cache-dir "$RESTIC_CACHE_DIR" forget \
+            --host "$RESTIC_HOST" \
+            --tag sqlite \
+            --tag newapi \
+            --tag "$BACKUP_NAME" \
+            --group-by host,tags \
+            --keep-last "$KEEP_LAST" \
+            --prune
     fi
 
     rm -f "$BACKUP_FILE"
@@ -88,13 +185,16 @@ EOF
     log "backup finished"
 }
 
-if [ "${RESTIC_INIT:-0}" = "1" ]; then
-    log "checking restic repository"
+check_backup_time_format
+init_repo_if_needed
 
-    if ! restic snapshots --cache-dir "$RESTIC_CACHE_DIR" >/dev/null 2>&1; then
-        log "initializing restic repository"
-        restic init --cache-dir "$RESTIC_CACHE_DIR"
-    fi
+if [ "${RESTORE_ON_START:-1}" = "1" ]; then
+    restore_latest
+fi
+
+if [ "${RESTORE_ONLY:-0}" = "1" ]; then
+    log "RESTORE_ONLY=1, exiting after restore"
+    exit 0
 fi
 
 if [ "${RUN_ONCE:-0}" = "1" ]; then

@@ -16,4 +16,4 @@ RUN chmod +x /usr/local/bin/backup.sh
 
 USER 10014
 
-CMD ["/usr/local/bin/backup.sh"]
+ENTRYPOINT ["/usr/local/bin/backup.sh"]

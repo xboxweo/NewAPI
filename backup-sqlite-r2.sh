@@ -4,23 +4,99 @@ set -eu
 DB_PATH="${DB_PATH:-/data/newapi/one-api.db}"
 BACKUP_NAME="${BACKUP_NAME:-one-api}"
 BACKUP_DIR="${BACKUP_DIR:-/tmp/sqlite-backup}"
-BACKUP_FILE="$BACKUP_DIR/${BACKUP_NAME}.db"
+BACKUP_FILE="${BACKUP_DIR}/${BACKUP_NAME}.db"
 
-RESTORE_DIR="${RESTORE_DIR:-/tmp/restic-restore}"
 RESTIC_CACHE_DIR="${RESTIC_CACHE_DIR:-/tmp/restic-cache}"
 RESTIC_HOST="${RESTIC_HOST:-new-api}"
 
-KEEP_LAST="${KEEP_LAST:-5}"
+RESTORE_ON_START="${RESTORE_ON_START:-1}"
+RESTORE_REQUIRED="${RESTORE_REQUIRED:-0}"
+RESTORE_ONLY="${RESTORE_ONLY:-0}"
 
-: "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY is required}"
-: "${RESTIC_PASSWORD:?RESTIC_PASSWORD is required}"
-: "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}"
-: "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
+RESTIC_INIT="${RESTIC_INIT:-0}"
+RESTIC_FORGET="${RESTIC_FORGET:-1}"
 
-mkdir -p "$BACKUP_DIR" "$RESTIC_CACHE_DIR"
+KEEP_LAST="${KEEP_LAST:-3}"
+
+RUN_ONCE="${RUN_ONCE:-0}"
+RUN_IMMEDIATELY="${RUN_IMMEDIATELY:-0}"
+
+BACKUP_TIME="${BACKUP_TIME:-}"
+INTERVAL_SECONDS="${INTERVAL_SECONDS:-86400}"
 
 log() {
     echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*"
+}
+
+fail() {
+    log "ERROR: $*"
+    exit 1
+}
+
+require_env() {
+    name="$1"
+    value="$(eval "printf '%s' \"\${$name:-}\"")"
+
+    if [ -z "$value" ]; then
+        fail "$name is required"
+    fi
+
+    case "$value" in
+        CHANGE_ME*)
+            fail "$name is still placeholder, please edit Dockerfile"
+            ;;
+        *CHANGE_ME*)
+            fail "$name contains CHANGE_ME placeholder, please edit Dockerfile"
+            ;;
+    esac
+}
+
+validate_config() {
+    require_env RESTIC_REPOSITORY
+    require_env RESTIC_PASSWORD
+    require_env AWS_ACCESS_KEY_ID
+    require_env AWS_SECRET_ACCESS_KEY
+
+    if [ -n "$BACKUP_TIME" ]; then
+        case "$BACKUP_TIME" in
+            [0-2][0-9]:[0-5][0-9]|[0-9]:[0-5][0-9])
+                BACKUP_H="${BACKUP_TIME%:*}"
+                BACKUP_M="${BACKUP_TIME#*:}"
+
+                BACKUP_H="$(echo "$BACKUP_H" | sed 's/^0*//')"
+                BACKUP_M="$(echo "$BACKUP_M" | sed 's/^0*//')"
+
+                [ -z "$BACKUP_H" ] && BACKUP_H=0
+                [ -z "$BACKUP_M" ] && BACKUP_M=0
+
+                if [ "$BACKUP_H" -gt 23 ] || [ "$BACKUP_M" -gt 59 ]; then
+                    fail "invalid BACKUP_TIME: $BACKUP_TIME, expected HH:MM"
+                fi
+                ;;
+            *)
+                fail "invalid BACKUP_TIME: $BACKUP_TIME, expected HH:MM"
+                ;;
+        esac
+    fi
+
+    case "$INTERVAL_SECONDS" in
+        ''|*[!0-9]*)
+            fail "INTERVAL_SECONDS must be a positive integer"
+            ;;
+        *)
+            if [ "$INTERVAL_SECONDS" -le 0 ]; then
+                fail "INTERVAL_SECONDS must be greater than 0"
+            fi
+            ;;
+    esac
+
+    if [ -z "$BACKUP_TIME" ] && [ -z "$INTERVAL_SECONDS" ]; then
+        fail "either BACKUP_TIME or INTERVAL_SECONDS is required"
+    fi
+}
+
+restic_cmd() {
+    restic --cache-dir "$RESTIC_CACHE_DIR" "$@"
 }
 
 strip_zero() {
@@ -53,93 +129,70 @@ seconds_until_backup_time() {
     echo "$WAIT_SECONDS"
 }
 
-check_backup_time_format() {
-    if [ -n "${BACKUP_TIME:-}" ]; then
-        case "$BACKUP_TIME" in
-            [0-2][0-9]:[0-5][0-9]|[0-9]:[0-5][0-9])
-                ;;
-            *)
-                log "invalid BACKUP_TIME: $BACKUP_TIME, expected format: HH:MM"
-                exit 1
-                ;;
-        esac
-    fi
-}
-
-init_repo_if_needed() {
-    if [ "${RESTIC_INIT:-0}" = "1" ]; then
+init_restic_repo_if_needed() {
+    if [ "$RESTIC_INIT" = "1" ]; then
         log "checking restic repository"
 
-        if ! restic --cache-dir "$RESTIC_CACHE_DIR" snapshots >/dev/null 2>&1; then
+        if ! restic_cmd snapshots >/dev/null 2>&1; then
             log "initializing restic repository"
-            restic --cache-dir "$RESTIC_CACHE_DIR" init
+            restic_cmd init
         else
             log "restic repository already initialized"
         fi
     fi
 }
 
-restore_latest() {
-    log "RESTORE_ON_START=1, restoring latest backup from remote repository"
+restore_latest_backup() {
+    log "RESTORE_ON_START=1, trying to restore latest backup from remote"
 
-    rm -rf "$RESTORE_DIR"
-    mkdir -p "$RESTORE_DIR"
+    DB_DIR="$(dirname "$DB_PATH")"
+    DB_TMP="${DB_PATH}.restore.tmp"
 
-    if ! restic --cache-dir "$RESTIC_CACHE_DIR" restore latest \
-        --target "$RESTORE_DIR" \
+    mkdir -p "$DB_DIR"
+    rm -f "$DB_TMP"
+
+    log "remote backup file path: $BACKUP_FILE"
+    log "local database path: $DB_PATH"
+
+    if restic_cmd dump \
         --host "$RESTIC_HOST" \
         --tag sqlite \
         --tag newapi \
-        --tag "$BACKUP_NAME"; then
+        --tag "$BACKUP_NAME" \
+        latest \
+        "$BACKUP_FILE" > "$DB_TMP"; then
 
-        log "no backup restored from remote repository"
+        if [ ! -s "$DB_TMP" ]; then
+            log "restored file is empty, abort restore"
+            rm -f "$DB_TMP"
 
-        if [ "${RESTORE_REQUIRED:-0}" = "1" ]; then
+            if [ "$RESTORE_REQUIRED" = "1" ]; then
+                exit 1
+            fi
+
+            return 0
+        fi
+
+        mv -f "$DB_TMP" "$DB_PATH"
+        rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
+
+        log "restore finished, local database overwritten: $DB_PATH"
+    else
+        rm -f "$DB_TMP"
+
+        log "no latest backup found or restore failed"
+
+        if [ "$RESTORE_REQUIRED" = "1" ]; then
             log "RESTORE_REQUIRED=1, exiting"
             exit 1
         fi
-
-        log "skip restore and continue"
-        return 0
     fi
-
-    RESTORED_FILE="$RESTORE_DIR$BACKUP_FILE"
-
-    if [ ! -f "$RESTORED_FILE" ]; then
-        RESTORED_FILE="$(find "$RESTORE_DIR" -type f -name "${BACKUP_NAME}.db" | sort | tail -n 1 || true)"
-    fi
-
-    if [ -z "${RESTORED_FILE:-}" ] || [ ! -f "$RESTORED_FILE" ]; then
-        log "restored file not found"
-
-        if [ "${RESTORE_REQUIRED:-0}" = "1" ]; then
-            exit 1
-        fi
-
-        return 0
-    fi
-
-    DB_DIR="$(dirname "$DB_PATH")"
-    mkdir -p "$DB_DIR"
-
-    TMP_DB="${DB_PATH}.restore.tmp"
-
-    log "overwriting local database"
-    log "source: $RESTORED_FILE"
-    log "target: $DB_PATH"
-
-    cat "$RESTORED_FILE" > "$TMP_DB"
-    mv -f "$TMP_DB" "$DB_PATH"
-
-    rm -f "${DB_PATH}-wal" "${DB_PATH}-shm"
-
-    log "restore finished"
 }
 
 backup_once() {
     log "starting sqlite backup"
     log "SQLite DB: $DB_PATH"
-    log "Backup file: $BACKUP_FILE"
+    log "temporary backup file: $BACKUP_FILE"
 
     if [ ! -f "$DB_PATH" ]; then
         log "database file not found: $DB_PATH"
@@ -161,16 +214,16 @@ EOF
 
     log "uploading backup to remote repository"
 
-    restic --cache-dir "$RESTIC_CACHE_DIR" backup "$BACKUP_FILE" \
+    restic_cmd backup "$BACKUP_FILE" \
         --host "$RESTIC_HOST" \
         --tag sqlite \
         --tag newapi \
         --tag "$BACKUP_NAME"
 
-    if [ "${RESTIC_FORGET:-1}" = "1" ]; then
-        log "applying retention policy: keep last $KEEP_LAST backups"
+    if [ "$RESTIC_FORGET" = "1" ]; then
+        log "applying retention policy: keep latest $KEEP_LAST backups"
 
-        restic --cache-dir "$RESTIC_CACHE_DIR" forget \
+        restic_cmd forget \
             --host "$RESTIC_HOST" \
             --tag sqlite \
             --tag newapi \
@@ -185,32 +238,36 @@ EOF
     log "backup finished"
 }
 
-check_backup_time_format
-init_repo_if_needed
+mkdir -p "$BACKUP_DIR" "$RESTIC_CACHE_DIR"
 
-if [ "${RESTORE_ON_START:-1}" = "1" ]; then
-    restore_latest
+validate_config
+init_restic_repo_if_needed
+
+if [ "$RESTORE_ON_START" = "1" ]; then
+    restore_latest_backup
+else
+    log "RESTORE_ON_START=0, skip restore"
 fi
 
-if [ "${RESTORE_ONLY:-0}" = "1" ]; then
+if [ "$RESTORE_ONLY" = "1" ]; then
     log "RESTORE_ONLY=1, exiting after restore"
     exit 0
 fi
 
-if [ "${RUN_ONCE:-0}" = "1" ]; then
+if [ "$RUN_ONCE" = "1" ]; then
     backup_once
     exit 0
 fi
 
-if [ -n "${BACKUP_TIME:-}" ]; then
+if [ "$RUN_IMMEDIATELY" = "1" ]; then
+    log "RUN_IMMEDIATELY=1, running backup now"
+    backup_once || log "backup failed"
+fi
+
+if [ -n "$BACKUP_TIME" ]; then
     log "daily backup mode enabled"
     log "BACKUP_TIME=$BACKUP_TIME"
     log "TZ=${TZ:-system-default}"
-
-    if [ "${RUN_IMMEDIATELY:-0}" = "1" ]; then
-        log "RUN_IMMEDIATELY=1, running backup now"
-        backup_once || log "backup failed"
-    fi
 
     while true; do
         WAIT_SECONDS="$(seconds_until_backup_time)"
@@ -220,8 +277,6 @@ if [ -n "${BACKUP_TIME:-}" ]; then
         backup_once || log "backup failed"
     done
 else
-    INTERVAL_SECONDS="${INTERVAL_SECONDS:-86400}"
-
     log "interval backup mode enabled"
     log "INTERVAL_SECONDS=$INTERVAL_SECONDS"
 

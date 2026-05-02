@@ -5,8 +5,8 @@ set -e
 : "${R2_BUCKET:?R2_BUCKET is required}"
 : "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID is required}"
 : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
-: "${DB_PATH:?DB_PATH is required}"
 
+DB_PATH="${DB_PATH:-/data/one-api.db}"
 R2_PREFIX="${R2_PREFIX:-newapi}"
 BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-21600}"
 
@@ -48,7 +48,6 @@ backup_once() {
 
 while true; do
   backup_once || echo "Backup failed at $(date)"
-
   echo "Sleeping ${BACKUP_INTERVAL_SECONDS}s..."
   sleep "$BACKUP_INTERVAL_SECONDS"
 done

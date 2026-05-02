@@ -12,8 +12,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backup.sh /usr/local/bin/backup.sh
-RUN chmod +x /usr/local/bin/backup.sh
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+
+RUN chmod +x /usr/local/bin/backup.sh /usr/local/bin/entrypoint.sh
 
 USER 10014
 
-ENTRYPOINT ["/usr/local/bin/backup.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

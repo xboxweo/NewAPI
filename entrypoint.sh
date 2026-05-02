@@ -1,4 +1,5 @@
 #!/bin/sh
+
 set -u
 
 log() {
@@ -19,9 +20,14 @@ require_env R2_BUCKET
 require_env AWS_ACCESS_KEY_ID
 require_env AWS_SECRET_ACCESS_KEY
 
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-auto}"
+export AWS_EC2_METADATA_DISABLED="${AWS_EC2_METADATA_DISABLED:-true}"
+export AWS_PAGER=""
+
 DB_PATH="${DB_PATH:-/data/one-api.db}"
 R2_PREFIX="${R2_PREFIX:-newapi}"
 BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-21600}"
+BACKUP_KEEP_COUNT="${BACKUP_KEEP_COUNT:-3}"
 WAIT_FOR_INIT="${WAIT_FOR_INIT:-true}"
 NEW_API_BIN="${NEW_API_BIN:-/new-api}"
 
@@ -45,9 +51,11 @@ log "R2_ENDPOINT=$R2_ENDPOINT"
 log "R2_BUCKET=$R2_BUCKET"
 log "R2_PREFIX=$R2_PREFIX"
 log "BACKUP_INTERVAL_SECONDS=$BACKUP_INTERVAL_SECONDS"
+log "BACKUP_KEEP_COUNT=$BACKUP_KEEP_COUNT"
 log "WAIT_FOR_INIT=$WAIT_FOR_INIT"
+log "NEW_API_BIN=$NEW_API_BIN"
 
-latest_backup_key() {
+list_backup_objects() {
   aws \
     --endpoint-url "$R2_ENDPOINT" \
     s3api list-objects-v2 \
@@ -55,57 +63,136 @@ latest_backup_key() {
     --prefix "$S3_PREFIX" \
     --query 'Contents[].[LastModified,Key]' \
     --output text 2>/dev/null \
-    | grep '\.db\.gz$' \
-    | sort \
-    | tail -n 1 \
-    | awk '{print $2}'
+    | awk '$2 ~ /\.db\.gz$/ {print $1 "\t" $2}' \
+    | sort
+}
+
+get_latest_backup_key() {
+  objects="$(list_backup_objects)" || return 1
+
+  if [ -z "$objects" ]; then
+    return 2
+  fi
+
+  printf '%s\n' "$objects" | tail -n 1 | awk -F '\t' '{print $2}'
+}
+
+prune_old_backups() {
+  log "Checking old backups for pruning..."
+
+  objects="$(list_backup_objects)" || {
+    log "Failed to list backups, skip pruning"
+    return 1
+  }
+
+  if [ -z "$objects" ]; then
+    log "No backups found, skip pruning"
+    return 0
+  fi
+
+  total="$(printf '%s\n' "$objects" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+  if [ "$total" -le "$BACKUP_KEEP_COUNT" ] 2>/dev/null; then
+    log "Backup count is $total, no pruning needed"
+    return 0
+  fi
+
+  delete_keys="$(printf '%s\n' "$objects" | awk -F '\t' -v keep="$BACKUP_KEEP_COUNT" '
+    NF >= 2 {
+      keys[++n] = $2
+    }
+    END {
+      limit = n - keep
+      for (i = 1; i <= limit; i++) {
+        print keys[i]
+      }
+    }
+  ')"
+
+  if [ -z "$delete_keys" ]; then
+    log "No backup needs to be deleted"
+    return 0
+  fi
+
+  echo "$delete_keys" | while IFS= read -r key; do
+    if [ -n "$key" ]; then
+      log "Deleting old backup: s3://$R2_BUCKET/$key"
+
+      aws \
+        --endpoint-url "$R2_ENDPOINT" \
+        s3api delete-object \
+        --bucket "$R2_BUCKET" \
+        --key "$key" >/dev/null || {
+          log "Failed to delete old backup: $key"
+        }
+    fi
+  done
+
+  log "Pruning finished, kept latest $BACKUP_KEEP_COUNT backups"
+  return 0
 }
 
 restore_latest_backup() {
   log "Checking latest backup from R2..."
 
-  LATEST_KEY="$(latest_backup_key || true)"
+  latest_key="$(get_latest_backup_key)"
+  status="$?"
 
-  if [ -z "$LATEST_KEY" ] || [ "$LATEST_KEY" = "None" ]; then
+  if [ "$status" = "2" ]; then
     log "No remote backup found"
+    return 2
+  fi
+
+  if [ "$status" != "0" ]; then
+    log "Failed to check remote backups"
     return 1
   fi
 
-  log "Latest remote backup: $LATEST_KEY"
+  if [ -z "$latest_key" ]; then
+    log "No remote backup found"
+    return 2
+  fi
 
-  RESTORE_GZ="$TMP_DIR/restore.db.gz"
-  RESTORE_DB="$TMP_DIR/restore.db"
+  log "Latest remote backup: s3://$R2_BUCKET/$latest_key"
 
-  rm -f "$RESTORE_GZ" "$RESTORE_DB"
+  restore_gz="$TMP_DIR/restore.db.gz"
+  restore_db="$TMP_DIR/restore.db"
+
+  rm -f "$restore_gz" "$restore_db"
 
   aws \
     --endpoint-url "$R2_ENDPOINT" \
-    s3 cp "s3://$R2_BUCKET/$LATEST_KEY" "$RESTORE_GZ" || {
+    s3 cp "s3://$R2_BUCKET/$latest_key" "$restore_gz" || {
       log "Download latest backup failed"
       return 1
     }
 
-  gzip -dc "$RESTORE_GZ" > "$RESTORE_DB" || {
+  gzip -dc "$restore_gz" > "$restore_db" || {
     log "Unzip backup failed"
     return 1
   }
 
-  if ! sqlite3 "$RESTORE_DB" "PRAGMA integrity_check;" | grep -qx "ok"; then
-    log "SQLite integrity check failed, refuse to restore"
+  integrity_result="$(sqlite3 "$restore_db" "PRAGMA integrity_check;" 2>/dev/null || true)"
+
+  if [ "$integrity_result" != "ok" ]; then
+    log "SQLite integrity check failed: $integrity_result"
     return 1
   fi
 
-  DB_DIR="$(dirname "$DB_PATH")"
-  mkdir -p "$DB_DIR"
+  db_dir="$(dirname "$DB_PATH")"
+  mkdir -p "$db_dir"
 
   if [ -f "$DB_PATH" ]; then
-    LOCAL_BAK="$DB_PATH.before-restore-$(date +%Y%m%d-%H%M%S)"
-    log "Local database exists, saving copy to $LOCAL_BAK"
-    cp "$DB_PATH" "$LOCAL_BAK" || return 1
+    local_bak="$DB_PATH.before-restore-$(date +%Y%m%d-%H%M%S)"
+    log "Local database exists, saving copy to $local_bak"
+    cp "$DB_PATH" "$local_bak" || {
+      log "Failed to save local database copy"
+      return 1
+    }
   fi
 
-  cp "$RESTORE_DB" "$DB_PATH" || {
-    log "Restore database failed"
+  cp "$restore_db" "$DB_PATH" || {
+    log "Failed to restore database to $DB_PATH"
     return 1
   }
 
@@ -114,51 +201,73 @@ restore_latest_backup() {
 }
 
 backup_once() {
-  TYPE="${1:-scheduled}"
+  backup_type="${1:-scheduled}"
 
-  log "Starting $TYPE backup..."
+  log "Starting $backup_type backup..."
 
   if [ ! -f "$DB_PATH" ]; then
     log "Database file not found: $DB_PATH"
     return 1
   fi
 
-  TIME="$(date +%Y%m%d-%H%M%S)"
-  TMP_DB="$TMP_DIR/one-api-$TIME.db"
-  TMP_GZ="$TMP_DB.gz"
-  OBJECT_KEY="${S3_PREFIX}one-api-$TIME.db.gz"
+  integrity_result="$(sqlite3 "$DB_PATH" "PRAGMA integrity_check;" 2>/dev/null || true)"
 
-  rm -f "$TMP_DB" "$TMP_GZ"
+  if [ "$integrity_result" != "ok" ]; then
+    log "Current database integrity check failed: $integrity_result"
+    return 1
+  fi
 
-  sqlite3 "$DB_PATH" ".backup '$TMP_DB'" || {
+  time_tag="$(date +%Y%m%d-%H%M%S)"
+  tmp_db="$TMP_DIR/one-api-$time_tag.db"
+  tmp_gz="$tmp_db.gz"
+  object_key="${S3_PREFIX}one-api-$time_tag.db.gz"
+
+  rm -f "$tmp_db" "$tmp_gz"
+
+  sqlite3 "$DB_PATH" ".backup '$tmp_db'" || {
     log "SQLite backup failed"
+    rm -f "$tmp_db" "$tmp_gz"
     return 1
   }
 
-  gzip -f "$TMP_DB" || {
+  gzip -f "$tmp_db" || {
     log "gzip failed"
+    rm -f "$tmp_db" "$tmp_gz"
     return 1
   }
 
   aws \
     --endpoint-url "$R2_ENDPOINT" \
-    s3 cp "$TMP_GZ" "s3://$R2_BUCKET/$OBJECT_KEY" || {
+    s3 cp "$tmp_gz" "s3://$R2_BUCKET/$object_key" || {
       log "Upload to R2 failed"
-      rm -f "$TMP_GZ"
+      rm -f "$tmp_gz"
       return 1
     }
 
-  rm -f "$TMP_GZ"
+  rm -f "$tmp_gz"
 
-  log "Backup uploaded: s3://$R2_BUCKET/$OBJECT_KEY"
-  log "$TYPE backup finished"
+  log "Backup uploaded: s3://$R2_BUCKET/$object_key"
+  log "$backup_type backup finished"
+
+  prune_old_backups || log "Prune old backups failed"
+
   return 0
+}
+
+ensure_app_running() {
+  if [ -n "$APP_PID" ]; then
+    if ! kill -0 "$APP_PID" 2>/dev/null; then
+      log "New API process is not running"
+      exit 1
+    fi
+  fi
 }
 
 wait_for_db() {
   log "Waiting for database file: $DB_PATH"
 
   while [ ! -f "$DB_PATH" ]; do
+    ensure_app_running
     log "Database file not found yet"
     sleep 5
   done
@@ -168,16 +277,18 @@ wait_for_db() {
 
 wait_for_init() {
   if [ "$WAIT_FOR_INIT" != "true" ]; then
-    log "WAIT_FOR_INIT is false, skip initialization check"
+    log "WAIT_FOR_INIT=false, skip initialization check"
     return 0
   fi
 
   log "Waiting for New API initialization..."
 
   while true; do
-    ROOT_COUNT="$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users WHERE role = 100 AND deleted_at IS NULL;" 2>/dev/null || echo 0)"
+    ensure_app_running
 
-    if [ "$ROOT_COUNT" -gt 0 ] 2>/dev/null; then
+    root_count="$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM users WHERE role = 100 AND deleted_at IS NULL;" 2>/dev/null || echo 0)"
+
+    if [ "$root_count" -gt 0 ] 2>/dev/null; then
       log "Root user exists, system initialized"
       return 0
     fi
@@ -218,16 +329,27 @@ trap stop_all INT TERM
 
 REMOTE_BACKUP_EXISTS="false"
 
-if restore_latest_backup; then
-  REMOTE_BACKUP_EXISTS="true"
-  log "Remote backup restored successfully"
-else
-  REMOTE_BACKUP_EXISTS="false"
-  log "No remote backup restored"
-fi
+restore_latest_backup
+restore_status="$?"
+
+case "$restore_status" in
+  0)
+    REMOTE_BACKUP_EXISTS="true"
+    log "Remote backup restored successfully"
+    prune_old_backups || log "Prune old backups failed"
+    ;;
+  2)
+    REMOTE_BACKUP_EXISTS="false"
+    log "No remote backup exists"
+    ;;
+  *)
+    log "Remote backup check or restore failed, exiting to avoid data loss"
+    exit 1
+    ;;
+esac
 
 log "Starting New API..."
-"$NEW_API_BIN" &
+"$NEW_API_BIN" "$@" &
 
 APP_PID="$!"
 
@@ -251,12 +373,12 @@ backup_loop &
 BACKUP_PID="$!"
 
 wait "$APP_PID"
-EXIT_CODE="$?"
+exit_code="$?"
 
-log "New API exited with code $EXIT_CODE"
+log "New API exited with code $exit_code"
 
 if [ -n "$BACKUP_PID" ]; then
   kill "$BACKUP_PID" 2>/dev/null || true
 fi
 
-exit "$EXIT_CODE"
+exit "$exit_code"

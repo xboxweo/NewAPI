@@ -1,3 +1,19 @@
 FROM calciumion/new-api:latest
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        sqlite3 \
+        awscli \
+        ca-certificates \
+        gzip \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backup.sh /usr/local/bin/backup.sh
+RUN chmod +x /usr/local/bin/backup.sh
+
 USER 10014
 
+CMD ["/usr/local/bin/backup.sh"]
